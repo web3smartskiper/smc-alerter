@@ -1,4 +1,5 @@
 import os
+from telethon.sessions import StringSession
 import asyncio
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
@@ -20,13 +21,14 @@ RECONNECT_DELAY = 10
 DEBUG = True  
 
 # ── Client setup ──────────────────────────────────────────────────────────────
+SESSION = os.getenv("TELETHON_SESSION", "")
+
 client = TelegramClient(
-    'smc_forwarder',
+    StringSession(SESSION),
     API_ID,
     API_HASH,
     connection_retries=5,
     timeout=30,
-    proxy=None,
     device_model="Mac",
     system_version="macOS",
     app_version="1.0"
