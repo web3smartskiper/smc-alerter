@@ -1,0 +1,8 @@
+python-telegram-bot==20.7
+httpx
+python-dotenv
+Pillow
+matplotlib
+numpy
+telethon
+PySocks
