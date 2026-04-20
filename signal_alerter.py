@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+from signal import signal
 import httpx
 import logging
 from io import BytesIO
@@ -88,8 +89,8 @@ def parse_signal(text: str) -> dict | None:
 
 async def fire_alarm(signal: dict):
     """Send a loud push notification to all devices via ntfy."""
-    direction_emoji = "🟢" if signal['direction'] == "BUY" else "🔴"
-    title = f"{direction_emoji} {signal['pair']} {signal['direction']} SIGNAL"
+    direction_tag = "BUY" if signal['direction'] == "BUY" else "SELL"
+    title = f"[{direction_tag}] {signal['pair']} {signal['direction']} SIGNAL"
     body = (
         f"Entry: {signal['entry']} | SL: {signal['sl']} | TP: {signal['tp']}\n"
         f"Confluence: {signal['confluence']}/10 | Risk: {signal['size']}\n"
