@@ -1,6 +1,8 @@
 import os
 import re
 import asyncio
+import json
+import time
 from signal import signal
 import httpx
 import logging
@@ -8,11 +10,9 @@ from io import BytesIO
 from datetime import datetime
 from dotenv import load_dotenv
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import numpy as np
+from alert_store import AlertStore
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 load_dotenv()
 
@@ -98,196 +98,134 @@ async def fire_alarm(signal: dict):
     )
 
     async with httpx.AsyncClient() as client:
-        await client.post(
+        response = await client.post(
             f"{NTFY_URL}/{NTFY_TOPIC}",
             content=body,
             headers={
                 "Title": title,
                 "Priority": "urgent",          # Makes it ring loudly
                 "Tags": "rotating_light,chart_with_upwards_trend",
-                "Sound": "alarm",              # Alarm sound on ntfy apps
             }
         )
-    logger.info(f"Alarm fired for {signal['pair']}")
+        response.raise_for_status()
+    logger.info(f"Push accepted for {signal['pair']}")
 
 
 # ─── VISUAL SIGNAL CARD ───────────────────────────────────────────────────────
 
-def generate_signal_chart(signal: dict) -> BytesIO:
-    """Generate a clean visual signal card as an image."""
-    is_buy = signal['direction'] == 'BUY'
-    accent = '#00C896' if is_buy else '#FF4C61'
-    bg = '#0D1117'
-    card_bg = '#161B22'
-    text_col = '#E6EDF3'
-    muted = '#8B949E'
-
-    fig, ax = plt.subplots(figsize=(10, 7))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 10)
-    ax.axis('off')
-
-    # Background card
-    card = mpatches.FancyBboxPatch((0.2, 0.2), 9.6, 9.6,
-                                    boxstyle="round,pad=0.1",
-                                    facecolor=card_bg, edgecolor=accent, linewidth=2)
-    ax.add_patch(card)
-
-    # Header bar
-    header = mpatches.FancyBboxPatch((0.2, 8.8), 9.6, 1.0,
-                                      boxstyle="round,pad=0.05",
-                                      facecolor=accent, edgecolor='none')
-    ax.add_patch(header)
-
-    # Title
-    mode_tag = f"[{signal['mode']}]"
-    ax.text(5, 9.35, f"{signal['pair']}  {signal['order_type']} {signal['direction']}  {mode_tag}",
-            ha='center', va='center', fontsize=16, fontweight='bold',
-            color='white' if is_buy else '#0D1117', fontfamily='monospace')
-
-    # Price levels — visual ladder
-    entry = signal['entry']
-    sl = signal['sl']
-    tp = signal['tp']
-    partial = signal.get('partial_tp')
-
-    # Normalize prices to chart Y space (between 2.5 and 8.5)
-    all_prices = [p for p in [entry, sl, tp, partial] if p is not None]
-    p_min, p_max = min(all_prices), max(all_prices)
-    p_range = p_max - p_min if p_max != p_min else 1
-
-    def price_to_y(p):
-        return 2.5 + ((p - p_min) / p_range) * 5.5
-
-    # Zone fills
-    entry_y = price_to_y(entry)
-    sl_y = price_to_y(sl)
-    tp_y = price_to_y(tp)
-
-    # SL zone (red)
-    sl_zone = plt.Polygon([[1.5, entry_y], [8.5, entry_y], [8.5, sl_y], [1.5, sl_y]],
-                           facecolor='#FF4C6133', edgecolor='none')
-    ax.add_patch(sl_zone)
-
-    # TP zone (green)
-    tp_zone = plt.Polygon([[1.5, entry_y], [8.5, entry_y], [8.5, tp_y], [1.5, tp_y]],
-                           facecolor='#00C89633', edgecolor='none')
-    ax.add_patch(tp_zone)
-
-    # Price lines
-    def draw_price_line(price, label, color, style='-', lw=1.5):
-        y = price_to_y(price)
-        ax.plot([1.5, 8.5], [y, y], color=color, linewidth=lw, linestyle=style)
-        ax.text(1.3, y, label, ha='right', va='center', fontsize=8,
-                color=color, fontfamily='monospace', fontweight='bold')
-        ax.text(8.7, y, f"{price:.4f}", ha='left', va='center', fontsize=8,
-                color=color, fontfamily='monospace')
-
-    draw_price_line(tp, 'TP', '#00C896', lw=2)
-    if partial:
-        draw_price_line(partial, f'P.TP {signal.get("partial_pct","")}%', '#7FDBCA', style='--')
-    draw_price_line(entry, 'ENTRY', accent, lw=2.5)
-    draw_price_line(sl, 'SL', '#FF4C61', lw=2)
-
-    # Candle arrow
-    arrow_x = 5
-    if is_buy:
-        ax.annotate('', xy=(arrow_x, entry_y + 0.3), xytext=(arrow_x, entry_y - 0.5),
-                    arrowprops=dict(arrowstyle='->', color=accent, lw=2))
-    else:
-        ax.annotate('', xy=(arrow_x, entry_y - 0.3), xytext=(arrow_x, entry_y + 0.5),
-                    arrowprops=dict(arrowstyle='->', color=accent, lw=2))
-
-    # Stats row
-    rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-    stats = [
-        ("CONFLUENCE", f"{signal['confluence']}/10"),
-        ("R:R RATIO", f"1:{rr:.1f}"),
-        ("RISK SIZE", signal['size']),
-        ("VOLATILITY", signal['volatility']),
-        ("TREND", signal['trend']),
-    ]
-
-    box_w = 9.2 / len(stats)
-    for i, (label, val) in enumerate(stats):
-        bx = 0.4 + i * box_w
-        stat_box = mpatches.FancyBboxPatch((bx, 0.5), box_w - 0.1, 1.6,
-                                            boxstyle="round,pad=0.05",
-                                            facecolor='#21262D', edgecolor=accent, linewidth=0.8)
-        ax.add_patch(stat_box)
-        ax.text(bx + (box_w - 0.1) / 2, 1.65, val, ha='center', va='center',
-                fontsize=9, fontweight='bold', color=accent, fontfamily='monospace')
-        ax.text(bx + (box_w - 0.1) / 2, 0.9, label, ha='center', va='center',
-                fontsize=6.5, color=muted, fontfamily='monospace')
-
-    # Confluence details
-    if signal['details']:
-        ax.text(0.5, 2.3, 'CONFLUENCES:', fontsize=8, color=muted,
-                fontfamily='monospace', va='top')
-        details_text = '   '.join([f"✦ {d}" for d in signal['details'][:4]])
-        ax.text(0.5, 2.0, details_text, fontsize=7.5, color=text_col,
-                fontfamily='monospace', va='top', wrap=True)
-        if len(signal['details']) > 4:
-            extra = '   '.join([f"✦ {d}" for d in signal['details'][4:]])
-            ax.text(0.5, 1.7, extra, fontsize=7.5, color=text_col,
-                    fontfamily='monospace', va='top')
-
-    # Timestamp
-    ts = datetime.utcnow().strftime('%Y-%m-%d  %H:%M:%S UTC')
-    ax.text(9.8, 0.1, ts, ha='right', va='bottom', fontsize=7,
-            color=muted, fontfamily='monospace')
-
-    plt.tight_layout(pad=0)
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight',
-                facecolor=bg, edgecolor='none')
-    plt.close()
-    buf.seek(0)
-    return buf
+from signal_card import generate_signal_chart
 
 
-# ─── TELEGRAM MESSAGE HANDLER ────────────────────────────────────────────────
+# ─── DURABLE DELIVERY AND ACKNOWLEDGEMENT ────────────────────────────────────
+
+REMINDER_SECONDS = max(30, int(os.getenv("REMINDER_SECONDS", "60")))
+MAX_PUSHES = max(1, int(os.getenv("MAX_PUSHES", "5")))
+ALERT_LIFETIME = max(60, int(os.getenv("ALERT_LIFETIME_SECONDS", "900")))
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a new message arrives in the chat."""
     message = update.message
     if not message or not message.text:
         return
+    if message.chat_id != int(os.environ["BRIDGE_GROUP_ID"]):
+        return
+    parsed = parse_signal(message.text)
+    if parsed:
+        context.application.bot_data["store"].add(message.chat_id, message.message_id, parsed)
 
-    text = message.text
-    signal = parse_signal(text)
 
-    if signal:
-        logger.info(f"Signal detected: {signal['pair']} {signal['direction']}")
+async def acknowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    owners = {int(value.strip()) for value in os.getenv("ALERT_OWNER_IDS", "").split(",") if value.strip()}
+    if owners and query.from_user.id not in owners:
+        await query.answer("Only configured alert owners can acknowledge this signal.", show_alert=True)
+        return
+    alert_id = int(query.data.split(":", 1)[1])
+    if context.application.bot_data["store"].acknowledge(alert_id, query.message.chat_id):
+        await query.answer("Acknowledged. Further reminders stopped.")
+        await query.edit_message_reply_markup(reply_markup=None)
+    else:
+        await query.answer("This alert is no longer available.")
 
-        # 1. Fire loud alarm on all devices immediately
-        await fire_alarm(signal)
 
-        # 2. Generate and send visual card back to same chat
+async def deliver_push(store, row, parsed):
+    now = time.time()
+    if row["acknowledged"] or row["push_count"] >= MAX_PUSHES or row["next_push"] > now:
+        return
+    try:
+        await fire_alarm(parsed)
+    except Exception:
+        logger.exception("Push delivery failed for alert %s; retrying", row["id"])
+        store.update(row["id"], next_push=time.time() + 30)
+    else:
+        store.update(row["id"], push_count=row["push_count"] + 1,
+                     next_push=time.time() + REMINDER_SECONDS)
+
+
+async def deliver_card(app, store, row, parsed):
+    if row["card_sent"] or row["next_card"] > time.time():
+        return
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Acknowledged — stop reminders", callback_data=f"ack:{row['id']}")]])
+    caption = f"{parsed['pair']} — {parsed['direction']} SETUP\nConfluence: {parsed['confluence']}/10 | Mode: {parsed['mode']}"
+    try:
+        # A single worker serializes matplotlib rendering, away from the Telegram event loop.
+        chart = await asyncio.to_thread(generate_signal_chart, parsed)
+    except Exception:
+        logger.exception("Image rendering failed; sending text alert %s", row["id"])
+        chart = None
+    try:
+        if chart is None:
+            await app.bot.send_message(chat_id=row["chat_id"], text=caption + f"\nEntry: {parsed['entry']} | SL: {parsed['sl']} | TP: {parsed['tp']}", reply_markup=keyboard)
+        else:
+            with chart:
+                await app.bot.send_photo(chat_id=row["chat_id"], photo=chart, caption=caption, reply_markup=keyboard)
+        store.update(row["id"], card_sent=1)
+    except Exception:
+        logger.exception("Telegram delivery failed for alert %s; retrying", row["id"])
+        store.update(row["id"], next_card=time.time() + 30)
+
+
+async def delivery_worker(app, channel):
+    store = app.bot_data["store"]
+    while True:
         try:
-            chart_buf = generate_signal_chart(signal)
-            caption = (
-                f"📊 *{signal['pair']} — {signal['direction']} SETUP*\n"
-                f"Confluence: `{signal['confluence']}/10` | Mode: `{signal['mode']}`"
-            )
-            await message.reply_photo(
-                photo=chart_buf,
-                caption=caption,
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.error(f"Chart generation failed: {e}")
+            for row in store.pending(ALERT_LIFETIME):
+                parsed = json.loads(row["payload"])
+                if channel == "push":
+                    await deliver_push(store, row, parsed)
+                else:
+                    await deliver_card(app, store, row, parsed)
+        except Exception:
+            logger.exception("Delivery worker error (%s)", channel)
+        await asyncio.sleep(1)
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+async def start_workers(app):
+    app.bot_data["store"] = AlertStore(os.getenv("ALERT_DB", "alerts.sqlite3"))
+    app.bot_data["workers"] = [asyncio.create_task(delivery_worker(app, channel)) for channel in ("push", "card")]
+
+
+async def stop_workers(app):
+    for task in app.bot_data["workers"]:
+        task.cancel()
+    await asyncio.gather(*app.bot_data["workers"], return_exceptions=True)
+    app.bot_data["store"].db.close()
+
 
 def main():
-    app = ApplicationBuilder().token(LISTENER_BOT_TOKEN).build()
+    for name in ("LISTENER_BOT_TOKEN", "NTFY_TOPIC", "BRIDGE_GROUP_ID"):
+        if not os.getenv(name):
+            raise EnvironmentError(f"Missing required environment variable: {name}")
+    int(os.environ["BRIDGE_GROUP_ID"])
+    app = (ApplicationBuilder().token(LISTENER_BOT_TOKEN)
+           .post_init(start_workers).post_stop(stop_workers).build())
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🚀 SMC Alert Bot is running...")
+    app.add_handler(CallbackQueryHandler(acknowledge, pattern=r"^ack:\d+$"))
+    logger.info("SMC alert delivery service starting")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()

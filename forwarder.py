@@ -18,7 +18,7 @@ BRIDGE_GROUP_ID    = int(os.getenv("BRIDGE_GROUP_ID"))
 MODEL_BOT_USERNAME = os.getenv("MODEL_BOT_USERNAME").lstrip("@")
 
 RECONNECT_DELAY = 10
-DEBUG = True  
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
 # ── Client setup ──────────────────────────────────────────────────────────────
 SESSION = os.getenv("TELETHON_SESSION", "")
@@ -111,6 +111,8 @@ async def main():
     while True:
         try:
             await client.run_until_disconnected()
+            # Let the supervisor restart after a clean disconnect too.
+            break
         except asyncio.CancelledError:
             break
         except Exception as e:

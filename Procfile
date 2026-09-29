@@ -1,1 +1,1 @@
-worker: python signal_alerter.py & python forwarder.py & wait
+worker: python run_services.py
